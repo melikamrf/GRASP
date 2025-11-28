@@ -1,0 +1,27 @@
+# Python bytecode / cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# Virtual environments
+grasp_env/
+env/
+venv/
+#
+/queries/ceb-imdb-full/
+
+
+# Weights, models, artifacts
+saved_models/
+wandb/
+processed_workloads/
+
+# Temporary / output files
+*.log
+training_curves_*.png
