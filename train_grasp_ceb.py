@@ -8,6 +8,7 @@ os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 import argparse
 import numpy as np
 import torch
+import pandas as pd
 
 import random
 
@@ -26,7 +27,7 @@ is_cuda = torch.cuda.is_available()
 IMDB_DIRECTORY = "./queries/ceb-imdb-full/"	# directory to save the IMDB dataset
 PROCESSED_WORKLOAD_DIRECTORY = "./processed_workloads/imdb/" # directory to save processed workloads
 
-def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4):
+def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4, residual=0):
 	start_time = time.time()
 	num_q = 3000
 	cdf_model_choice = 'arcdf'
@@ -51,13 +52,13 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4):
 	directory_list = [IMDB_DIRECTORY + temp_name + "/" for temp_name in template_list]
 
 
-	res_file = open("./grasp_{}_ratio_{}_lcsszie_{}_lr_{}_bs_{}.txt".format(",".join(template_list), sub_templates_in_training_ratio, lcs_dim, lr, bs), 'a')
+	res_file = open("./grasp_{}_ratio_{}_lcssize_{}_lr_{}_bs_{}.txt".format(",".join(template_list), sub_templates_in_training_ratio, lcs_dim, lr, bs), 'a')
 
 
 	(table_list, table_dim_list, table_like_dim_list, table_sizes, table_key_groups,
 	table_join_keys, table_text_cols, table_normal_cols, col_type, col2minmax) = get_table_info()
 
-	template2queries, template2cards, _, test_template2queries, test_template2cards, _ , colid2featlen_per_table = read_query_file_batched(col2minmax, num_q=num_q, directory_list=directory_list
+	template2queries, template2cards, template2pgcards, test_template2queries, test_template2cards, test_template2pgcards , colid2featlen_per_table = read_query_file_batched(col2minmax, num_q=num_q, directory_list=directory_list
 																																	,saved_ditectory=PROCESSED_WORKLOAD_DIRECTORY)
 	t2ops = get_table_to_ops(template2queries, test_template2queries)
 
@@ -79,9 +80,15 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4):
 	training_loader_per_parent_template = {}
 	in_test_loader_per_parent_template = {}
 	ood_test_loader_per_parent_template = {}
+	pg_q_errors = {'seen':[], 'unseen':[]}
+	
+	# For tracking query IDs in test sets
+	seen_query_ids = []
+	unseen_query_ids = []
 
 	num_qs = 0
-	test_num_qs = 0
+	test_unseen_num_qs = 0
+	test_seen_num_qs = 0
 	num_seen_templates = 0
 
 	### load seen join templates
@@ -89,9 +96,11 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4):
 		num_seen_templates += 1
 		training_queries = template2queries[template]
 		all_training_cards = template2cards[template]
+		training_pgcards = template2pgcards[template]
 
 		if len(all_training_cards) > 100:
 			num_train_per_temp = len(template2queries[template]) - 100
+			test_seen_num_qs += 100
 
 			num_qs += num_train_per_temp
 			# for training
@@ -121,9 +130,13 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4):
 					training_loader_per_parent_template[parent_t_list]['is_stb'].append(1)
 				training_loader_per_parent_template[parent_t_list]['parent_t_list'].append(table_tuple)
 				training_loader_per_parent_template[parent_t_list]['key_groups'].append(key_groups_per_q)
-				training_loader_per_parent_template[parent_t_list]['cards'].append(all_training_cards[qid])
+				if residual:
+					res_card = all_training_cards[qid] / training_pgcards[qid]
+					training_loader_per_parent_template[parent_t_list]['cards'].append(res_card)
+				else:
+					training_loader_per_parent_template[parent_t_list]['cards'].append(all_training_cards[qid])
 
-
+			# seen test queries
 			for qid, (q, q_context, q_reps, parent_key_groups, key_groups_per_q, parent_table_tuple, table_tuple, table_mask, table_group_mask) in enumerate(training_queries[-100:]):
 				parent_t_list = tuple(parent_table_tuple)
 				if parent_t_list not in in_test_loader_per_parent_template:
@@ -137,6 +150,8 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4):
 					in_test_loader_per_parent_template[parent_t_list]['parent_t_list'] = []
 					in_test_loader_per_parent_template[parent_t_list]['key_groups'] = []
 					in_test_loader_per_parent_template[parent_t_list]['cards'] = []
+					in_test_loader_per_parent_template[parent_t_list]['pg_cards'] = []
+					in_test_loader_per_parent_template[parent_t_list]['query_ids'] = []
 
 				
 				in_test_loader_per_parent_template[parent_t_list]['qs'].append(q)
@@ -150,10 +165,20 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4):
 					in_test_loader_per_parent_template[parent_t_list]['is_stb'].append(1)
 				in_test_loader_per_parent_template[parent_t_list]['parent_t_list'].append(parent_table_tuple)
 				in_test_loader_per_parent_template[parent_t_list]['key_groups'].append(parent_key_groups)
-				in_test_loader_per_parent_template[parent_t_list]['cards'].append(all_training_cards[num_train_per_temp+qid])
+				if residual:
+					res_card = all_training_cards[num_train_per_temp+qid] / training_pgcards[num_train_per_temp+qid]
+					in_test_loader_per_parent_template[parent_t_list]['cards'].append(res_card)
+				else: 
+					in_test_loader_per_parent_template[parent_t_list]['cards'].append(all_training_cards[num_train_per_temp+qid])
+				in_test_loader_per_parent_template[parent_t_list]['pg_cards'].append(training_pgcards[num_train_per_temp+qid])
+				in_test_loader_per_parent_template[parent_t_list]['query_ids'].append((template, num_train_per_temp+qid))
+			
+				actual = all_training_cards[num_train_per_temp+qid]
+				pg = training_pgcards[num_train_per_temp+qid]
+				pg_q_errors['seen'].append(max(pg/actual, actual/pg))
+				seen_query_ids.append((template, num_train_per_temp+qid))
 
-		else:
-			# for training
+		else: # use all for training
 			num_qs += len(training_queries)
 			for qid, (q, q_context, q_reps, parent_key_groups, key_groups_per_q, parent_table_tuple, table_tuple, table_mask, table_group_mask) in enumerate(training_queries):
 				
@@ -182,20 +207,26 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4):
 					training_loader_per_parent_template[parent_t_list]['is_stb'].append(1)
 				training_loader_per_parent_template[parent_t_list]['parent_t_list'].append(parent_table_tuple)
 				training_loader_per_parent_template[parent_t_list]['key_groups'].append(key_groups_per_q)
-				training_loader_per_parent_template[parent_t_list]['cards'].append(all_training_cards[qid])
+				if residual:
+					res_card = all_training_cards[qid] / training_pgcards[qid]
+					training_loader_per_parent_template[parent_t_list]['cards'].append(res_card)
+				else:
+					training_loader_per_parent_template[parent_t_list]['cards'].append(all_training_cards[qid])
 
 	### load unseen queries
 	for template in test_template2queries:
 		if len(test_template2queries[template]) < 10:
 			continue
 
-		test_num_qs += len(test_template2queries[template])
+		test_unseen_num_qs += 100 #len(test_template2queries[template]) #NOTE: i think this is wrong and should be 100
 
 		test_queries = test_template2queries[template]
 		test_cards = test_template2cards[template]
 
 		test_queries = list(test_queries)[:100]
 		test_cards = list(test_cards)[:100]
+		#pg test cards
+		pg_test_cards = list(test_template2pgcards[template])[:100]
 
 		for qid, (q, q_context, q_reps, parent_key_groups, key_groups_per_q, parent_table_tuple, table_tuple, table_mask, table_group_mask) in enumerate(test_queries):
 			parent_t_list = tuple(parent_table_tuple)
@@ -211,6 +242,8 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4):
 				ood_test_loader_per_parent_template[parent_t_list]['parent_t_list'] = []
 				ood_test_loader_per_parent_template[parent_t_list]['key_groups'] = []
 				ood_test_loader_per_parent_template[parent_t_list]['cards'] = []
+				ood_test_loader_per_parent_template[parent_t_list]['pg_cards'] = []
+				ood_test_loader_per_parent_template[parent_t_list]['query_ids'] = []
 			
 			ood_test_loader_per_parent_template[parent_t_list]['qs'].append(q)
 			ood_test_loader_per_parent_template[parent_t_list]['q_contexts'].append(q_context)
@@ -223,15 +256,29 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4):
 				ood_test_loader_per_parent_template[parent_t_list]['is_stb'].append(1)
 			ood_test_loader_per_parent_template[parent_t_list]['parent_t_list'].append(parent_table_tuple)
 			ood_test_loader_per_parent_template[parent_t_list]['key_groups'].append(parent_key_groups)
-			ood_test_loader_per_parent_template[parent_t_list]['cards'].append(test_cards[qid])
+			if residual:
+				res_card = test_cards[qid] / pg_test_cards[qid]
+				ood_test_loader_per_parent_template[parent_t_list]['cards'].append(res_card)
+			else:
+				ood_test_loader_per_parent_template[parent_t_list]['cards'].append(test_cards[qid])
+			ood_test_loader_per_parent_template[parent_t_list]['pg_cards'].append(pg_test_cards[qid])
+			ood_test_loader_per_parent_template[parent_t_list]['query_ids'].append((template, qid))
+			pg = pg_test_cards[qid]
+			actual = test_cards[qid]
+			pg_q_errors['unseen'].append(max(pg/actual, actual/pg))
+			unseen_query_ids.append((template, qid))
 
 	num_batches = math.ceil(num_qs / bs)
 
-	print("total number of queries: {}".format(num_qs))
+	print("total number of train queries: {}".format(num_qs))
 	print("total number of seen join templates: {}".format(num_seen_templates))
+	print("total number of seen test queries: {}".format(test_seen_num_qs))
+	print("total number of unseen test queries: {}".format(test_unseen_num_qs))
 
 	res_file.write("total number of queries: {} \n".format(num_qs))
 	res_file.write("total number of seen join templates: {}".format(num_seen_templates))
+	res_file.write("total number of seen test queries: {} \n".format(test_seen_num_qs))	
+	res_file.write("total number of unseen test queries: {} \n".format(test_unseen_num_qs))
 
 	#### start loading data for pytorch training
 
@@ -286,7 +333,7 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4):
 
 	for parent_t_list in ood_test_loader_per_parent_template:
 		tmp_object = ood_test_loader_per_parent_template[parent_t_list]
-
+		#NOTE: is batchsize 3000 ok here?
 		table_data_loader, parent_alias_list, training_keys, training_tables = join_handler.load_training_queries_w_masks(tmp_object['qs'], 
 																													tmp_object['q_contexts'],
 																													tmp_object['qreps'], 
@@ -304,11 +351,6 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4):
 		ood_test_tables_list.append(training_tables)
 
 	############ finish data loading
-
-	def calculate_gmean(x):
-		"""Calculate geometric mean of array x, handling zeros properly"""
-		log_x = np.log(np.maximum(x, 1e-10))  # avoid log(0)
-		return np.exp(np.mean(log_x))
 
 	progress_bar = tqdm(range(epoch), desc="Training progress")
 	for epoch_id in progress_bar:
@@ -348,7 +390,7 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4):
 				se_loss = torch.square(torch.squeeze(est_cards) - batch_cards)
 
 				ultimate_loss = torch.where(torch.squeeze(est_cards) > 0, sle_loss, se_loss)
-				total_loss = torch.mean(ultimate_loss) #why mean? and not sum?
+				total_loss = torch.mean(ultimate_loss)
 				accu_loss_total += total_loss.item()
 
 				# Calculate Q-error for this batch
@@ -392,7 +434,6 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4):
 		# Calculate final metrics for the epoch
 		epoch_qerrors = np.array(epoch_qerrors)
 		median_qerror = np.median(epoch_qerrors)
-		gmean_qerror = calculate_gmean(epoch_qerrors)
 		under_ratio = epoch_under_count / epoch_total_preds if epoch_total_preds > 0 else 0
 		over_ratio = epoch_over_count / epoch_total_preds if epoch_total_preds > 0 else 0
 		
@@ -400,11 +441,10 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4):
 		progress_bar.set_postfix({
 			'loss': f'{avg_loss:.4f}',
 			'med_q': f'{median_qerror:.4f}',
-			'gmean_q': f'{gmean_qerror:.4f}',
 			'under/over': f'{under_ratio:.2f}/{over_ratio:.2f}',
 			'time': f'{epoch_time:.2f}s'
 		})
-
+		# Evaluate on test sets
 		if epoch_id > 1:
 			join_handler.start_eval()
 			with torch.no_grad():
@@ -420,17 +460,10 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4):
 							all_est_cards.extend(est_cards.cpu().detach())
 							all_true_cards.extend(batch_cards.cpu().detach())
 				q_errors = get_join_qerror(all_est_cards, all_true_cards, "seen", res_file, epoch_id)
+				pg_q_errors = get_join_qerror(all_est_cards, all_true_cards, "seen", res_file, epoch_id) #TODO: this is wrong for pg
 				seen_median_qerror = np.median(q_errors)
 				seen_test_losses.append(seen_median_qerror)
 				
-			
-				# Print metrics
-				print(f"Seen templates metrics - Epoch {epoch_id}:")
-				print(f"  Median Q-Error: {seen_median_qerror:.4f}")
-				print(f"  Mean Q-Error: {np.mean(q_errors):.4f}")
-				print(f"  90th percentile Q-Error: {np.percentile(q_errors, 90):.4f}")
-				print(f"  95th percentile Q-Error: {np.percentile(q_errors, 95):.4f}")
-				print(f"  99th percentile Q-Error: {np.percentile(q_errors, 99):.4f}")
 
 				### unseen join templates 
 				all_est_cards = []
@@ -443,22 +476,15 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4):
 							est_cards = torch.where(est_cards > 1, est_cards, 1.)
 							all_est_cards.extend(est_cards.cpu().detach())
 							all_true_cards.extend(batch_cards.cpu().detach())
-				q_errors = get_join_qerror(all_est_cards, all_true_cards, "unseen", res_file, epoch_id)
+				q_errors = get_join_qerror(all_est_cards, all_true_cards, "unseen", res_file, epoch_id) #this will print results and save to file.
+				pg_q_errors = get_join_qerror(all_est_cards, all_true_cards, "unseen", res_file, epoch_id) #TODO: this is wrong for pg
 				unseen_median_qerror = np.median(q_errors)
 				unseen_test_losses.append(unseen_median_qerror)
 				
-				# Print metrics
-				print(f"Unseen templates metrics - Epoch {epoch_id}:")
-				print(f"  Median Q-Error: {unseen_median_qerror:.4f}")
-				print(f"  Mean Q-Error: {np.mean(q_errors):.4f}")
-				print(f"  90th percentile Q-Error: {np.percentile(q_errors, 90):.4f}")
-				print(f"  95th percentile Q-Error: {np.percentile(q_errors, 95):.4f}")
-				print(f"  99th percentile Q-Error: {np.percentile(q_errors, 99):.4f}")
 
 			# Save checkpoint every 10 epochs (saves model + optimizer + metrics)
 			if (epoch_id + 1) % 10 == 0:
 				# safe fallback for filename parts that might be undefined
-				
 				
 				checkpoint = {
 					'optimizer_state_dict': optimizer.state_dict(),
@@ -469,53 +495,171 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4):
 					'seen_test_losses': seen_test_losses,
 					'unseen_test_losses': unseen_test_losses
 				}
-				join_handler.save_models(epoch_id + 1, bs, lr)
+				join_handler.save_models(epoch_id + 1, bs, lr, lcs_dim)
+			# last epoch:
+			if epoch_id == epoch - 1:
+				# Collect all data from seen test set
+				seen_pg_cards = []
+				seen_true_cards = []
+				seen_est_cards = []
+				seen_query_ids_list = []
+				
+				for table_data_loader, test_parent_alias, test_keys, test_tables, parent_t_list in zip(in_test_data_loader_list, in_test_parent_alias_list, in_test_training_keys_list, in_test_tables_list, in_test_loader_per_parent_template):
+					pg_cards_for_loader = in_test_loader_per_parent_template[parent_t_list]['pg_cards']
+					query_ids_for_loader = in_test_loader_per_parent_template[parent_t_list]['query_ids']
+					
+					for i, batch in enumerate(table_data_loader):
+						est_cards = join_handler.batch_estimate_join_queries_from_loader_w_mask(batch, test_parent_alias, test_keys, test_tables, is_cuda=is_cuda)
+						if est_cards is not None:
+							batch_cards = batch[-1]
+							est_cards = torch.where(est_cards > 1, est_cards, 1.)
+							seen_est_cards.extend(est_cards.cpu().detach().numpy())
+							seen_true_cards.extend(batch_cards.cpu().detach().numpy())
+							seen_pg_cards.extend(pg_cards_for_loader[i*len(batch):(i+1)*len(batch)])
+							for j in range(len(batch)):
+								idx = i*len(batch) + j
+								if idx < len(query_ids_for_loader):
+									seen_query_ids_list.append(query_ids_for_loader[idx])
+				
+				# Collect all data from unseen test set
+				unseen_pg_cards = []
+				unseen_true_cards = []
+				unseen_est_cards = []
+				unseen_query_ids_list = []
+				
+				for table_data_loader, test_parent_alias, test_keys, test_tables, parent_t_list in zip(ood_test_data_loader_list, ood_test_parent_alias_list, ood_test_training_keys_list, ood_test_tables_list, ood_test_loader_per_parent_template):
+					pg_cards_for_loader = ood_test_loader_per_parent_template[parent_t_list]['pg_cards']
+					query_ids_for_loader = ood_test_loader_per_parent_template[parent_t_list]['query_ids']
+					
+					for i, batch in enumerate(table_data_loader):
+						est_cards = join_handler.batch_estimate_join_queries_from_loader_w_mask(batch, test_parent_alias, test_keys, test_tables, is_cuda=is_cuda)
+						if est_cards is not None:
+							batch_cards = batch[-1]
+							est_cards = torch.where(est_cards > 1, est_cards, 1.)
+							unseen_est_cards.extend(est_cards.cpu().detach().numpy())
+							unseen_true_cards.extend(batch_cards.cpu().detach().numpy())
+							unseen_pg_cards.extend(pg_cards_for_loader[i*len(batch):(i+1)*len(batch)])
+							for j in range(len(batch)):
+								idx = i*len(batch) + j
+								if idx < len(query_ids_for_loader):
+									unseen_query_ids_list.append(query_ids_for_loader[idx])
+				
+				# Create dataframe for seen templates
+				seen_df = pd.DataFrame({
+					'template': [qid[0] for qid in seen_query_ids_list],
+					'query_id': [qid[1] for qid in seen_query_ids_list],
+					'type': ['seen'] * len(seen_query_ids_list),
+					'pg_estimate': seen_pg_cards,
+					'true_cardinality': seen_true_cards,
+					'model_estimate': seen_est_cards
+				})
+				
+				# Create dataframe for unseen templates
+				unseen_df = pd.DataFrame({
+					'template': [qid[0] for qid in unseen_query_ids_list],
+					'query_id': [qid[1] for qid in unseen_query_ids_list],
+					'type': ['unseen'] * len(unseen_query_ids_list),
+					'pg_estimate': unseen_pg_cards,
+					'true_cardinality': unseen_true_cards,
+					'model_estimate': unseen_est_cards
+				})
+				
+				# Combine both dataframes
+				estimations_df = pd.concat([seen_df, unseen_df], ignore_index=True)
+				
+				# Save to CSV
+				estimations_df.to_csv('estimations_dataframe.csv', index=False)
+				print("Estimations dataframe saved to 'estimations_dataframe.csv'")
+				
+				# Plot estimations for both seen and unseen
+				plot_estimations(seen_pg_cards, seen_true_cards, seen_est_cards, title='Seen Templates')
+				plot_estimations(unseen_pg_cards, unseen_true_cards, unseen_est_cards, title='Unseen Templates')
+
+
 
 	# Log total training time and finish
 	total_time = time.time() - start_time
 	print(f"Total training time: {total_time:.2f}s")
 	
+	
 	# Plot training and validation curves
-	plt.figure(figsize=(12, 8))
+	# plt.figure(figsize=(12, 8))
 	
-	# Plot 1: Training Loss and Q-Error
-	plt.subplot(2, 1, 1)
-	plt.plot(train_losses, label='SLE Loss', alpha=0.7)
-	plt.plot(np.convolve(train_qerrors, np.ones(50)/50, mode='valid'), 
-			label='Training Q-Error (MA50)', alpha=0.7)
-	plt.title('Training Metrics over Time')
-	plt.xlabel('Updates')
-	plt.ylabel('Value')
-	plt.legend()
-	plt.grid(True)
+	# # Plot 1: Training Loss and Q-Error
+	# plt.subplot(2, 1, 1)
+	# plt.plot(train_losses, label='SLE Loss', alpha=0.7)
+	# plt.plot(np.convolve(train_qerrors, np.ones(50)/50, mode='valid'), 
+	# 		label='Training Q-Error (MA50)', alpha=0.7)
+	# plt.title('Training Metrics over Time')
+	# plt.xlabel('Updates')
+	# plt.ylabel('Value')
+	# plt.legend()
+	# plt.grid(True)
 	
-	# Plot 2: Test Q-Error and Estimation Bias
-	plt.subplot(2, 1, 2)
-	plt.plot(seen_test_losses, label='Seen Templates', color='blue', alpha=0.7)
-	plt.plot(unseen_test_losses, label='Unseen Templates', color='red', alpha=0.7)
+	# # Plot 2: Test Q-Error and Estimation Bias
+	# plt.subplot(2, 1, 2)
+	# plt.plot(seen_test_losses, label='Seen Templates', color='blue', alpha=0.7)
+	# plt.plot(unseen_test_losses, label='Unseen Templates', color='red', alpha=0.7)
 	
-	# Add under/over estimation as filled areas
-	under_ratio = np.convolve(train_under_ratios, np.ones(50)/50, mode='valid')
-	over_ratio = np.convolve(train_over_ratios, np.ones(50)/50, mode='valid')
-	x = np.arange(len(under_ratio))
-	plt.fill_between(x, 0, under_ratio, alpha=0.2, color='blue', label='Underestimation')
-	plt.fill_between(x, 0, over_ratio, alpha=0.2, color='red', label='Overestimation')
+	# # Add under/over estimation as filled areas
+	# under_ratio = np.convolve(train_under_ratios, np.ones(50)/50, mode='valid')
+	# over_ratio = np.convolve(train_over_ratios, np.ones(50)/50, mode='valid')
+	# x = np.arange(len(under_ratio))
+	# plt.fill_between(x, 0, under_ratio, alpha=0.2, color='blue', label='Underestimation')
+	# plt.fill_between(x, 0, over_ratio, alpha=0.2, color='red', label='Overestimation')
 	
-	plt.title('Test Q-Error and Estimation Bias')
-	plt.xlabel('Epoch')
-	plt.ylabel('Value')
-	plt.legend()
-	plt.grid(True)
+	# plt.title('Test Q-Error and Estimation Bias')
+	# plt.xlabel('Epoch')
+	# plt.ylabel('Value')
+	# plt.legend()
+	# plt.grid(True)
 	
-	plt.tight_layout()
-	plot_path = f"./training_curves_{','.join(template_list)}_ratio_{sub_templates_in_training_ratio}.png"
-	plt.savefig(plot_path)
-	print(f"Training curves saved to {plot_path}")
+	# plt.tight_layout()
+	# plot_path = f"./training_curves_{','.join(template_list)}_ratio_{sub_templates_in_training_ratio}.png"
+	# plt.savefig(plot_path)
+	# print(f"Training curves saved to {plot_path}")
 	
-	# Save model
-	join_handler.save_models(epoch_id + 1, bs, lr)
-	res_file.close()
+	# # Save model
+	# join_handler.save_models(epoch_id + 1, bs, lr, lcs_dim)
+	
+	# res_file.write("PG Test workload:{}: Mean: {}, GMean: {}, Median: {}, 90: {}; 95: {}; 99: {}; Max:{} \n".format(
+	# 'seen', np.mean(pg_q_errors['seen']), gmean(pg_q_errors['seen']), np.median(pg_q_errors['seen']),
+	# np.percentile(pg_q_errors['seen'],90), np.percentile(pg_q_errors['seen'],95), np.percentile(pg_q_errors['seen'],99), np.max(pg_q_errors['seen'])))		
+	
+	# res_file.write("PG Test workload:{}: Mean: {}, GMean: {}, Median: {}, 90: {}; 95: {}; 99: {}; Max:{} \n".format(
+	# 'unseen', np.mean(pg_q_errors['unseen']), gmean(pg_q_errors['unseen']), np.median(pg_q_errors['unseen']),
+	# np.percentile(pg_q_errors['unseen'],90), np.percentile(pg_q_errors['unseen'],95), np.percentile(pg_q_errors['unseen'],99), np.max(pg_q_errors['unseen'])))		
+	# res_file.flush()
 
+	res_file.close()
+	return pg_q_errors
+
+def plot_estimations(pg, true_cards, est, title='unseen'):
+
+	plt.figure(figsize=(10, 6))
+	plt.suptitle(title)
+	plt.subplot(1,2,1)
+	plt.plot(pg, label='PG Estimations', color='blue', alpha=0.7)
+	plt.plot(true_cards, label='True Cardinalities', color='orange', alpha=0.7)
+	plt.plot(est, label='GRASP Estimations', color='green', alpha=0.7)
+	plt.plot(true_cards/pg, label='True/PG Ratio', color='red', alpha=0.7)
+	plt.xlabel('Query Index')
+	plt.ylabel('Cardinality')
+	plt.legend()
+	plt.grid(True)
+	plt.tight_layout()
+	plt.savefig('estimations_plot.png')
+	print("Estimations plot saved as 'estimations_plot.png'")	
+
+	plt.subplot(1,2,2)
+	plt.scatter(true_cards, pg, label='PG Estimations', color='blue', alpha=0.7)
+	plt.scatter(true_cards, est, label='GRASP Estimations', color='green', alpha=0.7)
+	plt.legend()
+	plt.xlabel('True Cardinalities')
+	plt.show()
+	
+
+	
 def main():
 	"""
 	Main function to parse command-line arguments and initiate the training process.
@@ -532,11 +676,14 @@ def main():
 	parser.add_argument("--feature_dim", help="dimension of hidden layer of CE model (default: 256)", type=int, default=256)
 	parser.add_argument("--lcs_dim", help="Dimension of the latent space of LCS model (default: 500)", type=int, default=500)
 	parser.add_argument("--bs", help="batch size (default: 128)", type=int, default=128)
+	parser.add_argument("--residual", type=int, default=0)
 	args = parser.parse_args()
 
 	is_cuda = torch.cuda.is_available()
 
-	train_grasp(args.epochs, args.feature_dim, args.lcs_dim, args.bs)
+	pg_q_errors = train_grasp(args.epochs, args.feature_dim, args.lcs_dim, args.bs, residual=args.residual)
+
 
 if __name__ == "__main__":
 	main()
+    #TODO: I need to set the random see, to be sure of the residual performance.

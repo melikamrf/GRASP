@@ -4,6 +4,7 @@ import argparse
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import torch
 import random
+import time
 
 from dsb_utlities.join_utilits_dsb import *
 from GRASP.join_handler_dsb import *
@@ -272,8 +273,9 @@ def main():
 	args = parser.parse_args()
 
 	is_cuda = torch.cuda.is_available()
-
+	start = time.time()
 	train_grasp(args.epochs, args.feature_dim, args.lcs_dim, args.bs)
-
+	end = time.time()
+	print("Total training time (in seconds): {}".format(end - start))
 if __name__ == "__main__":
 	main()

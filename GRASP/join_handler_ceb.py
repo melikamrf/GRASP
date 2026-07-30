@@ -546,7 +546,6 @@ class JoinHandler():
 								   training_table_group_masks, is_stb_queries, training_cards, bs=64, is_cuda=True, is_shuffle=True):
 		#### list of join queries
 		#### batch_size * table2predicates_list
-
 		normal_qs_list = []
 		qreps_list = []
 
@@ -1095,7 +1094,7 @@ class JoinHandler():
 			if join_model is not None:
 				join_model.cuda()
 
-	def save_models(self, epoch_id, bs, lr, save_directory='./saved_models/grasp/'):
+	def save_models(self, epoch_id, bs, lr, lcs, save_directory='./saved_models/grasp/'):
 		"""
         Saves all models to disk.
 
@@ -1106,7 +1105,7 @@ class JoinHandler():
             save_directory (str): Directory to save models.
         """
 
-		info = "{}+{}+{}".format(epoch_id, bs, lr)
+		info = "{}+{}+{}+{}".format(epoch_id, bs, lr, lcs)
 		if not os.path.exists(save_directory + info):
 			os.makedirs(save_directory + info)
 
@@ -1125,7 +1124,7 @@ class JoinHandler():
 			if join_model is not None:
 				torch.save(join_model, f"{save_directory}/unified_join_model_{table_name}_{idx}.pt")
 
-	def load_models_from_disk(self, epoch_id, bs, lr, save_directory='./saved_models/grasp/'):
+	def load_models_from_disk(self, epoch_id, bs, lr, lcs, save_directory='./saved_models/grasp/'):
 		"""
         Loads all models from disk.
 
@@ -1136,7 +1135,7 @@ class JoinHandler():
             save_directory (str): Directory to load models from.
         """
 
-		info = "{}+{}+{}".format(epoch_id, bs, lr)
+		info = "{}+{}+{}+{}".format(epoch_id, bs, lr, lcs)
 		save_directory = save_directory + info
 
 		for idx in range(len(self.table_cdf_models)):
