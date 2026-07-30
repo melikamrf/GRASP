@@ -1,5 +1,8 @@
 import math
 import os
+import time
+from tqdm import tqdm
+import matplotlib.pyplot as plt
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 import argparse
@@ -7,8 +10,6 @@ import numpy as np
 import torch
 
 import random
-
-import os
 
 from CEB_utlities.join_utilits_CEB_job import *
 from GRASP.join_handler_ceb import *
@@ -22,12 +23,25 @@ random.seed(42)
 
 is_cuda = torch.cuda.is_available()
 
-IMDB_DIRECTORY = "/home/imdb/"	# directory to save the IMDB dataset
-PROCESSED_WORKLOAD_DIRECTORY = "/home/processed_workloads/" # directory to save processed workloads
+IMDB_DIRECTORY = "./queries/ceb-imdb-full/"	# directory to save the IMDB dataset
+PROCESSED_WORKLOAD_DIRECTORY = "./processed_workloads/imdb/" # directory to save processed workloads
 
 def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4):
+	start_time = time.time()
 	num_q = 3000
 	cdf_model_choice = 'arcdf'
+	
+	# Initialize tracking variables
+	train_losses = []  # SLE loss
+	train_qerrors = []  # Q-error during training
+	train_under_ratios = []  # Ratio of underestimations
+	train_over_ratios = []   # Ratio of overestimations
+	seen_test_losses = []
+	unseen_test_losses = []
+	# For early stopping
+	# best_seen_qerror = float('inf')
+	# best_model_state = None
+	# epochs_without_improvement = 0
 
 
 	template_list =  ['1a', '2a', '2b', '2c', '3a', '3b', '4a', '5a', '6a', 
@@ -291,10 +305,22 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4):
 
 	############ finish data loading
 
-	for epoch_id in range(epoch):
+	def calculate_gmean(x):
+		"""Calculate geometric mean of array x, handling zeros properly"""
+		log_x = np.log(np.maximum(x, 1e-10))  # avoid log(0)
+		return np.exp(np.mean(log_x))
+
+	progress_bar = tqdm(range(epoch), desc="Training progress")
+	for epoch_id in progress_bar:
+		epoch_start_time = time.time()
 		join_handler.start_train()
 
+		# Reset epoch statistics
 		accu_loss_total = 0.
+		epoch_qerrors = []
+		epoch_under_count = 0
+		epoch_over_count = 0
+		epoch_total_preds = 0
 		
 		current_data_loader_ids = list(range(len(data_loader_iter_list)))
 		while len(current_data_loader_ids) > 0:
@@ -322,21 +348,62 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4):
 				se_loss = torch.square(torch.squeeze(est_cards) - batch_cards)
 
 				ultimate_loss = torch.where(torch.squeeze(est_cards) > 0, sle_loss, se_loss)
-				total_loss = torch.mean(ultimate_loss)
-
+				total_loss = torch.mean(ultimate_loss) #why mean? and not sum?
 				accu_loss_total += total_loss.item()
 
+				# Calculate Q-error for this batch
+				est_np = torch.squeeze(est_cards).detach().cpu().numpy()
+				true_np = batch_cards.detach().cpu().numpy()
+				
+				# Ensure arrays are properly shaped
+				if np.isscalar(est_np):
+					est_np = np.array([est_np])
+					true_np = np.array([true_np])
+					
+				q_errors = np.maximum(est_np/true_np, true_np/est_np)
+				batch_qerror = np.median(q_errors)
+				
+				# Update epoch statistics
+				epoch_qerrors.extend(q_errors.flatten())
+				epoch_under_count += int(np.sum(est_np < true_np))
+				epoch_over_count += int(np.sum(est_np > true_np))
+				epoch_total_preds += est_np.size
+				
 				with torch.autograd.set_detect_anomaly(True):
 					total_loss.backward()
 					clip_grad_norm_(join_handler.get_parameters(), 10.)
 					optimizer.step()	
+					
+				# Track batch-level metrics for plotting
+				if not math.isnan(batch_qerror):
+					train_qerrors.append(batch_qerror)
+					train_under_ratios.append(epoch_under_count/epoch_total_preds)
+					train_over_ratios.append(epoch_over_count/epoch_total_preds)
 
 			except StopIteration:
 				# When the iterator is exhausted, we get here
 				current_data_loader_ids.remove(d_loader_id)
 				data_loader_iter_list[d_loader_id] = iter(data_loader_list[d_loader_id])
 
-		print("epoch: {}; loss: {}".format(epoch_id, accu_loss_total / num_batches))
+		epoch_time = time.time() - epoch_start_time
+		avg_loss = accu_loss_total / num_batches
+		train_losses.append(avg_loss)
+		
+		# Calculate final metrics for the epoch
+		epoch_qerrors = np.array(epoch_qerrors)
+		median_qerror = np.median(epoch_qerrors)
+		gmean_qerror = calculate_gmean(epoch_qerrors)
+		under_ratio = epoch_under_count / epoch_total_preds if epoch_total_preds > 0 else 0
+		over_ratio = epoch_over_count / epoch_total_preds if epoch_total_preds > 0 else 0
+		
+		# Update progress bar
+		progress_bar.set_postfix({
+			'loss': f'{avg_loss:.4f}',
+			'med_q': f'{median_qerror:.4f}',
+			'gmean_q': f'{gmean_qerror:.4f}',
+			'under/over': f'{under_ratio:.2f}/{over_ratio:.2f}',
+			'time': f'{epoch_time:.2f}s'
+		})
 
 		if epoch_id > 1:
 			join_handler.start_eval()
@@ -353,6 +420,17 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4):
 							all_est_cards.extend(est_cards.cpu().detach())
 							all_true_cards.extend(batch_cards.cpu().detach())
 				q_errors = get_join_qerror(all_est_cards, all_true_cards, "seen", res_file, epoch_id)
+				seen_median_qerror = np.median(q_errors)
+				seen_test_losses.append(seen_median_qerror)
+				
+			
+				# Print metrics
+				print(f"Seen templates metrics - Epoch {epoch_id}:")
+				print(f"  Median Q-Error: {seen_median_qerror:.4f}")
+				print(f"  Mean Q-Error: {np.mean(q_errors):.4f}")
+				print(f"  90th percentile Q-Error: {np.percentile(q_errors, 90):.4f}")
+				print(f"  95th percentile Q-Error: {np.percentile(q_errors, 95):.4f}")
+				print(f"  99th percentile Q-Error: {np.percentile(q_errors, 99):.4f}")
 
 				### unseen join templates 
 				all_est_cards = []
@@ -366,7 +444,77 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4):
 							all_est_cards.extend(est_cards.cpu().detach())
 							all_true_cards.extend(batch_cards.cpu().detach())
 				q_errors = get_join_qerror(all_est_cards, all_true_cards, "unseen", res_file, epoch_id)
+				unseen_median_qerror = np.median(q_errors)
+				unseen_test_losses.append(unseen_median_qerror)
+				
+				# Print metrics
+				print(f"Unseen templates metrics - Epoch {epoch_id}:")
+				print(f"  Median Q-Error: {unseen_median_qerror:.4f}")
+				print(f"  Mean Q-Error: {np.mean(q_errors):.4f}")
+				print(f"  90th percentile Q-Error: {np.percentile(q_errors, 90):.4f}")
+				print(f"  95th percentile Q-Error: {np.percentile(q_errors, 95):.4f}")
+				print(f"  99th percentile Q-Error: {np.percentile(q_errors, 99):.4f}")
 
+			# Save checkpoint every 10 epochs (saves model + optimizer + metrics)
+			if (epoch_id + 1) % 10 == 0:
+				# safe fallback for filename parts that might be undefined
+				
+				
+				checkpoint = {
+					'optimizer_state_dict': optimizer.state_dict(),
+					'train_losses': train_losses,
+					'train_qerrors': train_qerrors,
+					'train_under_ratios': train_under_ratios,
+					'train_over_ratios': train_over_ratios,
+					'seen_test_losses': seen_test_losses,
+					'unseen_test_losses': unseen_test_losses
+				}
+				join_handler.save_models(epoch_id + 1, bs, lr)
+
+	# Log total training time and finish
+	total_time = time.time() - start_time
+	print(f"Total training time: {total_time:.2f}s")
+	
+	# Plot training and validation curves
+	plt.figure(figsize=(12, 8))
+	
+	# Plot 1: Training Loss and Q-Error
+	plt.subplot(2, 1, 1)
+	plt.plot(train_losses, label='SLE Loss', alpha=0.7)
+	plt.plot(np.convolve(train_qerrors, np.ones(50)/50, mode='valid'), 
+			label='Training Q-Error (MA50)', alpha=0.7)
+	plt.title('Training Metrics over Time')
+	plt.xlabel('Updates')
+	plt.ylabel('Value')
+	plt.legend()
+	plt.grid(True)
+	
+	# Plot 2: Test Q-Error and Estimation Bias
+	plt.subplot(2, 1, 2)
+	plt.plot(seen_test_losses, label='Seen Templates', color='blue', alpha=0.7)
+	plt.plot(unseen_test_losses, label='Unseen Templates', color='red', alpha=0.7)
+	
+	# Add under/over estimation as filled areas
+	under_ratio = np.convolve(train_under_ratios, np.ones(50)/50, mode='valid')
+	over_ratio = np.convolve(train_over_ratios, np.ones(50)/50, mode='valid')
+	x = np.arange(len(under_ratio))
+	plt.fill_between(x, 0, under_ratio, alpha=0.2, color='blue', label='Underestimation')
+	plt.fill_between(x, 0, over_ratio, alpha=0.2, color='red', label='Overestimation')
+	
+	plt.title('Test Q-Error and Estimation Bias')
+	plt.xlabel('Epoch')
+	plt.ylabel('Value')
+	plt.legend()
+	plt.grid(True)
+	
+	plt.tight_layout()
+	plot_path = f"./training_curves_{','.join(template_list)}_ratio_{sub_templates_in_training_ratio}.png"
+	plt.savefig(plot_path)
+	print(f"Training curves saved to {plot_path}")
+	
+	# Save model
+	join_handler.save_models(epoch_id + 1, bs, lr)
+	res_file.close()
 
 def main():
 	"""

@@ -667,10 +667,12 @@ def read_query_file_batched(col2minmax, num_q=10000, test_size=1000, directory_l
 	training_queries = []
 	training_cards = []
 	pg_training_cards = []
+	training_raw = []
 
 	test_queries = []
 	test_cards = []
 	pg_test_cards = []
+	test_raw = []
 
 	saved_predicates = {}
 
@@ -687,6 +689,11 @@ def read_query_file_batched(col2minmax, num_q=10000, test_size=1000, directory_l
 		# Filter out files that do not have a .csv extension
 		files = [file for file in files if file.endswith('.pkl')]
 
+		'''
+		for each query file in the directory, load the query representation and extract relevant information
+		such as tables, aliases, joins, predicates, and cardinalities. 
+		The extracted information is then organized into dictionaries for further processing.
+		'''
 		for qid, file in enumerate(files):
 			file_path = os.path.join(directory, file)
 			qrep = load_qrep(file_path)
@@ -707,6 +714,35 @@ def read_query_file_batched(col2minmax, num_q=10000, test_size=1000, directory_l
 
 			joins = get_joins(qrep)
 			preds, pred_cols, pred_types, pred_vals = get_predicates(qrep)
+
+			# parse and sort joins
+			raw_joins_list = []
+			for j_str in joins:
+				if ' = ' in j_str:
+					p1, p2 = j_str.strip().split(' = ')
+					t1, c1 = p1.split('.')
+					t2, c2 = p2.split('.')
+					if t1 > t2:
+						raw_joins_list.append((t2, c2, t1, c1))
+					else:
+						raw_joins_list.append((t1, c1, t2, c2))
+			raw_joins_list.sort()
+			raw_joins = tuple(raw_joins_list)
+
+			raw_preds_list = []
+			for idx_i in range(len(pred_cols)):
+				for idx_j in range(len(pred_cols[idx_i])):
+					c_str = pred_cols[idx_i][idx_j]
+					t_p, c_p = c_str.split('.')
+					op_p = pred_types[idx_i][idx_j]
+					val_p = pred_vals[idx_i][idx_j]
+					if isinstance(val_p, list):
+						val_p = tuple(val_p)
+					raw_preds_list.append((t_p, c_p, op_p, val_p))
+			raw_preds_list.sort(key=lambda x: str(x))
+			raw_preds = tuple(raw_preds_list)
+			
+			template_name = file
 
 			trues = get_true_cardinalities(qrep)
 			ests = get_postgres_cardinalities(qrep)
@@ -745,6 +781,7 @@ def read_query_file_batched(col2minmax, num_q=10000, test_size=1000, directory_l
 					col_id = FILTER_COLS[full_t].index(standard_col_name)
 
 					if standard_col_name not in PURE_LIKE_COLS:
+						#NOTE: val_visited
 						if val in vals_visited:
 							break
 						else:
@@ -967,6 +1004,7 @@ def read_query_file_batched(col2minmax, num_q=10000, test_size=1000, directory_l
 					training_queries.append(query_info)
 					training_cards.append(card)
 					pg_training_cards.append(pg_card)
+					training_raw.append((template_name, raw_joins, raw_preds))
 
 					### add subqueries as test queries
 					for k, v in trues.items():
@@ -1061,19 +1099,42 @@ def read_query_file_batched(col2minmax, num_q=10000, test_size=1000, directory_l
 						if q_json_str not in saved_predicates[t_list_key]:
 							subquery_joins = subplan_to_joins(qrep, k)
 
+							sub_raw_joins_list = []
 							for join in subquery_joins:
-
+								if ' = ' not in join: continue
 								parts = join.strip().split(' = ')
 								alias_table1 = parts[0].split('.')[0]
 								alias_table2 = parts[1].split('.')[0]
 
 								col1 = parts[0].split('.')[1]
+								col2 = parts[1].split('.')[1]
 
 								if len(global_origial_alias_to_aliases[drop_trailing_number(alias_table1)]) == 1:
 									alias_table1 = drop_trailing_number(alias_table1)
 
 								if len(global_origial_alias_to_aliases[drop_trailing_number(alias_table2)]) == 1:
 									alias_table2 = drop_trailing_number(alias_table2)
+								
+								if alias_table1 > alias_table2:
+									sub_raw_joins_list.append((alias_table2, col2, alias_table1, col1))
+								else:
+									sub_raw_joins_list.append((alias_table1, col1, alias_table2, col2))
+							sub_raw_joins_list.sort()
+							sub_raw_joins = tuple(sub_raw_joins_list)
+
+							sub_raw_preds_list = []
+							for idx_i in range(len(pred_cols)):
+								for idx_j in range(len(pred_cols[idx_i])):
+									c_str = pred_cols[idx_i][idx_j]
+									t_p, c_p = c_str.split('.')
+									mapped_t_p = drop_trailing_number(t_p) if len(global_origial_alias_to_aliases[drop_trailing_number(t_p)]) == 1 else t_p
+									if mapped_t_p in local_new_k:
+										op_p = pred_types[idx_i][idx_j]
+										val_p = pred_vals[idx_i][idx_j]
+										if isinstance(val_p, list): val_p = tuple(val_p)
+										sub_raw_preds_list.append((mapped_t_p, c_p, op_p, val_p))
+							sub_raw_preds_list.sort(key=lambda x: str(x))
+							sub_raw_preds = tuple(sub_raw_preds_list)
 
 							saved_predicates[t_list_key].add(q_json_str)
 
@@ -1081,19 +1142,22 @@ def read_query_file_batched(col2minmax, num_q=10000, test_size=1000, directory_l
 								training_queries.append(sub_query_info)
 								training_cards.append(sub_card)
 								pg_training_cards.append(sub_pg_card)
+								training_raw.append((template_name, sub_raw_joins, sub_raw_preds))
 							else:
 								test_queries.append(sub_query_info)
 								test_cards.append(sub_card)
 								pg_test_cards.append(sub_pg_card)
+								test_raw.append((template_name, sub_raw_joins, sub_raw_preds))
 			else:
 				pass
 	
 	template2queries = {}
 	template2cards = {}
 	template2pgcards = {}
+	template2raw = {}
 	print(len(training_queries))
 
-	for query_info, card, pg_card in zip(training_queries, training_cards, pg_training_cards):
+	for query_info, card, pg_card, raw_info in zip(training_queries, training_cards, pg_training_cards, training_raw):
 		table_list = query_info[-3]
 		table_list = tuple(table_list)
 
@@ -1101,31 +1165,36 @@ def read_query_file_batched(col2minmax, num_q=10000, test_size=1000, directory_l
 			template2queries[table_list] = [query_info]
 			template2cards[table_list] = [card]
 			template2pgcards[table_list] = [pg_card]
+			template2raw[table_list] = [raw_info]
 		else:
 			template2queries[table_list].append(query_info)
 			template2cards[table_list].append(card)
 			template2pgcards[table_list].append(pg_card)
+			template2raw[table_list].append(raw_info)
 
 	### shuffle training sets
 	for table_list in template2queries:
-		zipped = list(zip(template2queries[table_list], template2cards[table_list], template2pgcards[table_list]))
+		zipped = list(zip(template2queries[table_list], template2cards[table_list], template2pgcards[table_list], template2raw[table_list]))
 		random.shuffle(zipped)
 
-		new_qs, new_cards, new_pgcards = zip(*zipped)
+		new_qs, new_cards, new_pgcards, new_raws = zip(*zipped)
 
 		template2queries[table_list] = list(new_qs)
 		template2cards[table_list] = list(new_cards)
 		template2pgcards[table_list] = list(new_pgcards)
+		template2raw[table_list] = list(new_raws)
 
 	test_template2queries = {}
 	test_template2cards = {}
 	test_template2pgcards = {}
+	test_template2raw = {}
 
 	processed_test_template2queries = {}
 	processed_test_template2cards = {}
 	processed_test_template2pgcards = {}
+	processed_test_template2raw = {}
 
-	for query_info, card, pg_card in zip(test_queries, test_cards, pg_test_cards):
+	for query_info, card, pg_card, raw_info in zip(test_queries, test_cards, pg_test_cards, test_raw):
 		table_list = query_info[-3]
 		table_list = tuple(table_list)
 
@@ -1133,10 +1202,12 @@ def read_query_file_batched(col2minmax, num_q=10000, test_size=1000, directory_l
 			test_template2queries[table_list] = [query_info]
 			test_template2cards[table_list] = [card]
 			test_template2pgcards[table_list] = [pg_card]
+			test_template2raw[table_list] = [raw_info]
 		else:
 			test_template2queries[table_list].append(query_info)
 			test_template2cards[table_list].append(card)
 			test_template2pgcards[table_list].append(pg_card)
+			test_template2raw[table_list].append(raw_info)
 
 	### random sample 100 unseen templates for test, each template has at least 10 queries.
 	### this is for effcient evaluation, since the results are close to a full test set.
@@ -1151,18 +1222,61 @@ def read_query_file_batched(col2minmax, num_q=10000, test_size=1000, directory_l
 		test_queries = test_template2queries[template]
 		test_cards = test_template2cards[template]
 		test_pgcards = test_template2pgcards[template]
+		test_raws = test_template2raw[template]
 
-		combined = list(zip(test_queries, test_cards, test_pgcards))
+		combined = list(zip(test_queries, test_cards, test_pgcards, test_raws))
 		random.shuffle(combined)
-		test_queries, test_cards, test_pgcards = zip(*combined)
+		test_queries, test_cards, test_pgcards, test_raws = zip(*combined)
 
 		test_queries = list(test_queries)[:100]
 		test_cards = list(test_cards)[:100]
 		test_pgcards = list(test_pgcards)[:100]
+		test_raws = list(test_raws)[:100]
 
 		processed_test_template2queries[template] = test_queries
 		processed_test_template2cards[template] = test_cards
 		processed_test_template2pgcards[template] = test_pgcards
+		processed_test_template2raw[template] = test_raws
+
+	import csv
+	print("start writing raw queries to CSV")
+	with open(workload_file_path + 'train_raw_queries.csv', 'w', newline='', encoding='utf-8') as f:
+		writer = csv.writer(f)
+		writer.writerow(['template', 'join_tables', 'predicates', 'pgcard', 'true_card', 'model_card'])
+		for template in template2raw:
+			cards = template2cards[template]
+			pgcards = template2pgcards[template]
+			raws = template2raw[template]
+			if len(cards) > 100:
+				n_train = len(cards) - 100
+				for i in range(n_train):
+					tmpl, jns, prds = raws[i]
+					writer.writerow([tmpl, str(jns), str(prds), pgcards[i], cards[i], 'N/A'])
+			else:
+				for i in range(len(cards)):
+					tmpl, jns, prds = raws[i]
+					writer.writerow([tmpl, str(jns), str(prds), pgcards[i], cards[i], 'N/A'])
+
+	with open(workload_file_path + 'test_raw_queries.csv', 'w', newline='', encoding='utf-8') as f:
+		writer = csv.writer(f)
+		writer.writerow(['template', 'join_tables', 'predicates', 'pgcard', 'true_card', 'model_card', 'seen_or_unseen'])
+		for template in template2raw:
+			cards = template2cards[template]
+			pgcards = template2pgcards[template]
+			raws = template2raw[template]
+			if len(cards) > 100:
+				n_train = len(cards) - 100
+				for i in range(n_train, len(cards)):
+					tmpl, jns, prds = raws[i]
+					writer.writerow([tmpl, str(jns), str(prds), pgcards[i], cards[i], 'N/A', 'seen'])
+		
+		for template in processed_test_template2raw:
+			cards = processed_test_template2cards[template]
+			pgcards = processed_test_template2pgcards[template]
+			raws = processed_test_template2raw[template]
+			for i in range(len(cards)):
+				tmpl, jns, prds = raws[i]
+				writer.writerow([tmpl, str(jns), str(prds), pgcards[i], cards[i], 'N/A', 'unseen'])
 
 	print("start template2queries to file")
 	with open(workload_file_path + 'template2queries.pkl', "wb") as pickle_file:
