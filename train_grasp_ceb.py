@@ -323,8 +323,8 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4, residu
 																													tmp_object['table_group_masks'], 
 																													tmp_object['is_stb'], 
 																													tmp_object['cards'], 
-																													3000, is_cuda=is_cuda)
-		
+																													3000, is_cuda=is_cuda, is_shuffle=False)
+
 
 		in_test_data_loader_list.append(table_data_loader)
 		in_test_parent_alias_list.append(parent_alias_list)
@@ -342,8 +342,8 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4, residu
 																													tmp_object['table_group_masks'], 
 																													tmp_object['is_stb'], 
 																													tmp_object['cards'], 
-																													3000, is_cuda=is_cuda)
-		
+																													3000, is_cuda=is_cuda, is_shuffle=False)
+
 
 		ood_test_data_loader_list.append(table_data_loader)
 		ood_test_parent_alias_list.append(parent_alias_list)
@@ -508,18 +508,20 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4, residu
 					pg_cards_for_loader = in_test_loader_per_parent_template[parent_t_list]['pg_cards']
 					query_ids_for_loader = in_test_loader_per_parent_template[parent_t_list]['query_ids']
 					
-					for i, batch in enumerate(table_data_loader):
+					offset = 0
+					for batch in table_data_loader:
+						# batch is a tuple of per-table tensors, so len(batch) counts tensors,
+						# not rows; take the row count from the cards tensor instead.
+						batch_size = len(batch[-1])
 						est_cards = join_handler.batch_estimate_join_queries_from_loader_w_mask(batch, test_parent_alias, test_keys, test_tables, is_cuda=is_cuda)
 						if est_cards is not None:
 							batch_cards = batch[-1]
 							est_cards = torch.where(est_cards > 1, est_cards, 1.)
 							seen_est_cards.extend(est_cards.cpu().detach().numpy())
 							seen_true_cards.extend(batch_cards.cpu().detach().numpy())
-							seen_pg_cards.extend(pg_cards_for_loader[i*len(batch):(i+1)*len(batch)])
-							for j in range(len(batch)):
-								idx = i*len(batch) + j
-								if idx < len(query_ids_for_loader):
-									seen_query_ids_list.append(query_ids_for_loader[idx])
+							seen_pg_cards.extend(pg_cards_for_loader[offset:offset + batch_size])
+							seen_query_ids_list.extend(query_ids_for_loader[offset:offset + batch_size])
+						offset += batch_size
 				
 				# Collect all data from unseen test set
 				unseen_pg_cards = []
@@ -531,18 +533,20 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4, residu
 					pg_cards_for_loader = ood_test_loader_per_parent_template[parent_t_list]['pg_cards']
 					query_ids_for_loader = ood_test_loader_per_parent_template[parent_t_list]['query_ids']
 					
-					for i, batch in enumerate(table_data_loader):
+					offset = 0
+					for batch in table_data_loader:
+						# batch is a tuple of per-table tensors, so len(batch) counts tensors,
+						# not rows; take the row count from the cards tensor instead.
+						batch_size = len(batch[-1])
 						est_cards = join_handler.batch_estimate_join_queries_from_loader_w_mask(batch, test_parent_alias, test_keys, test_tables, is_cuda=is_cuda)
 						if est_cards is not None:
 							batch_cards = batch[-1]
 							est_cards = torch.where(est_cards > 1, est_cards, 1.)
 							unseen_est_cards.extend(est_cards.cpu().detach().numpy())
 							unseen_true_cards.extend(batch_cards.cpu().detach().numpy())
-							unseen_pg_cards.extend(pg_cards_for_loader[i*len(batch):(i+1)*len(batch)])
-							for j in range(len(batch)):
-								idx = i*len(batch) + j
-								if idx < len(query_ids_for_loader):
-									unseen_query_ids_list.append(query_ids_for_loader[idx])
+							unseen_pg_cards.extend(pg_cards_for_loader[offset:offset + batch_size])
+							unseen_query_ids_list.extend(query_ids_for_loader[offset:offset + batch_size])
+						offset += batch_size
 				
 				# Create dataframe for seen templates
 				seen_df = pd.DataFrame({
