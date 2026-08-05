@@ -640,28 +640,42 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4, residu
 
 def plot_estimations(pg, true_cards, est, title='unseen'):
 
-	plt.figure(figsize=(10, 6))
+	# The callers pass Python lists; arithmetic below needs arrays.
+	pg = np.asarray(pg, dtype=np.float64)
+	true_cards = np.asarray(true_cards, dtype=np.float64)
+	est = np.asarray(est, dtype=np.float64)
+	# PG can report 0 rows, which would make the ratio inf/nan.
+	ratio = true_cards / np.maximum(pg, 1.)
+
+	plt.figure(figsize=(12, 6))
 	plt.suptitle(title)
 	plt.subplot(1,2,1)
 	plt.plot(pg, label='PG Estimations', color='blue', alpha=0.7)
 	plt.plot(true_cards, label='True Cardinalities', color='orange', alpha=0.7)
 	plt.plot(est, label='GRASP Estimations', color='green', alpha=0.7)
-	plt.plot(true_cards/pg, label='True/PG Ratio', color='red', alpha=0.7)
+	plt.plot(ratio, label='True/PG Ratio', color='red', alpha=0.7)
+	plt.yscale('log')
 	plt.xlabel('Query Index')
 	plt.ylabel('Cardinality')
 	plt.legend()
 	plt.grid(True)
-	plt.tight_layout()
-	plt.savefig('estimations_plot.png')
-	print("Estimations plot saved as 'estimations_plot.png'")	
 
 	plt.subplot(1,2,2)
 	plt.scatter(true_cards, pg, label='PG Estimations', color='blue', alpha=0.7)
 	plt.scatter(true_cards, est, label='GRASP Estimations', color='green', alpha=0.7)
+	plt.xscale('log')
+	plt.yscale('log')
 	plt.legend()
 	plt.xlabel('True Cardinalities')
-	plt.show()
-	
+	plt.ylabel('Estimated Cardinality')
+	plt.grid(True)
+
+	plt.tight_layout()
+	plot_path = f"estimations_plot_{title.replace(' ', '_').lower()}.png"
+	plt.savefig(plot_path)
+	plt.close()
+	print(f"Estimations plot saved as '{plot_path}'")
+
 
 	
 def main():
