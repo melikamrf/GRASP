@@ -204,6 +204,11 @@ def _load_directory(directory, col2minmax, colid2featlen_per_table, max_files=No
 	"""Parses every qrep in a directory into GRASP query_info records.
 
 	Returns parallel lists of (query_info, true_card, pg_card, raw_description).
+
+	saved_predicates is the subplan dedup ledger. Pass a dict to keep one subplan per
+	distinct (table set, predicate set) - what training wants, since a few filters recur
+	across tens of thousands of queries. Pass None to keep every subplan of every query,
+	which is what evaluation wants: each test query should be scored on its own subplans.
 	"""
 	files = sorted(file for file in os.listdir(directory) if file.endswith('.pkl'))
 	if max_files is not None:
@@ -274,13 +279,13 @@ def _load_directory(directory, col2minmax, colid2featlen_per_table, max_files=No
 
 			# Subplans repeat heavily across the workload; keep one per distinct
 			# (table set, predicate set) so common single-table filters don't dominate.
-			signature = json.dumps({t: sub_normal[t] for t in subplan}, sort_keys=True,
-			                       default=default_serializer)
-			table_key = tuple(sub_aliases)
-			seen = saved_predicates.setdefault(table_key, set())
-			if signature in seen:
-				continue
-			seen.add(signature)
+			if saved_predicates is not None:
+				signature = json.dumps({t: sub_normal[t] for t in subplan}, sort_keys=True,
+				                       default=default_serializer)
+				seen = saved_predicates.setdefault(tuple(sub_aliases), set())
+				if signature in seen:
+					continue
+				seen.add(signature)
 
 			sub_table_mask, sub_table_group_mask = generate_key_group_mask(
 				list(subplan), key_groups)
@@ -302,6 +307,9 @@ def _group_by_table_tuple(queries, cards, pg_cards, raws):
 	template2cards = {}
 	template2pgcards = {}
 	template2raw = {}
+	# Source qrep file per record, parallel to the lists above: it is the only stable
+	# handle back to the original query, since query ids are just list positions.
+	template2files = {}
 
 	for query_info, card, pg_card, raw in zip(queries, cards, pg_cards, raws):
 		table_list = tuple(query_info[-3])
@@ -309,8 +317,9 @@ def _group_by_table_tuple(queries, cards, pg_cards, raws):
 		template2cards.setdefault(table_list, []).append(card)
 		template2pgcards.setdefault(table_list, []).append(pg_card)
 		template2raw.setdefault(table_list, []).append(raw)
+		template2files.setdefault(table_list, []).append(raw[0])
 
-	return template2queries, template2cards, template2pgcards, template2raw
+	return template2queries, template2cards, template2pgcards, template2raw, template2files
 
 
 def _write_raw_csv(path, template2cards, template2pgcards, template2raw):
@@ -324,65 +333,115 @@ def _write_raw_csv(path, template2cards, template2pgcards, template2raw):
 				writer.writerow([raw[0], str(raw[1]), str(raw[2]), pg_card, card, 'N/A'])
 
 
-_CACHE_FILES = ['template2queries', 'template2cards', 'template2pgcards',
-                'test_template2queries', 'test_template2cards', 'test_template2pgcards',
-                'colid2featlen_per_table']
+# The two sides of the workload are cached under separate prefixes. Parsing the training
+# directory is the expensive half (tens of thousands of qreps), and it does not depend on
+# how the test set is built - so changing a test-side option re-parses only the test
+# directory and leaves the training cache untouched.
+_TRAIN_CACHE_FILES = ['template2queries', 'template2cards', 'template2pgcards',
+                      'colid2featlen_per_table']
+_TEST_CACHE_FILES = ['test_template2queries', 'test_template2cards',
+                     'test_template2pgcards', 'test_template2files',
+                     'test_colid2featlen_per_table']
+
+
+def _load_cache(prefix, names):
+	loaded = []
+	for name in names:
+		print("load {}".format(name))
+		with open(prefix + name + '.pkl', "rb") as pickle_file:
+			loaded.append(pickle.load(pickle_file))
+	return tuple(loaded)
+
+
+def _save_cache(prefix, names, objs):
+	for name, obj in zip(names, objs):
+		print("writing {}".format(name))
+		with open(prefix + name + '.pkl', "wb") as pickle_file:
+			pickle.dump(obj, pickle_file)
+
+
+def _merge_featlens(target, other):
+	"""Folds one colid2featlen_per_table into another; entries are per-column maxima."""
+	for table, featlens in other.items():
+		merged = target.setdefault(table, {})
+		for col_id, featlen in featlens.items():
+			merged[col_id] = max(featlen, merged.get(col_id, 0))
+	return target
 
 
 def read_joblight_query_files(col2minmax, train_directory, test_directory,
-                              saved_directory, num_train_q=None, include_subplans=True):
+                              saved_directory, num_train_q=None, include_subplans=True,
+                              include_test_subplans=False):
 	"""Loads JOB-light training queries and the fixed JOB-light test queries.
 
-	Returns the same 7-tuple shape as read_query_file_batched, so the GRASP training
-	code can consume it unchanged. Unlike that function the test set is not sampled
-	from the training queries - it is the external `test_directory` verbatim.
+	Returns the 7-tuple read_query_file_batched produces, plus an eighth element mapping
+	each test join template to the qrep file every one of its records came from. Unlike
+	that function the test set is not sampled from the training queries - it is the
+	external `test_directory` verbatim.
+
+	include_test_subplans additionally evaluates every subplan of every test query, not
+	just the full join. Test subplans are never deduplicated against each other or against
+	the training set, so each test query keeps its own complete set of subplans.
 	"""
-	workload_file_path = "{}joblight-{}-{}-".format(
+	train_prefix = "{}joblight-{}-{}-".format(
 		saved_directory, num_train_q if num_train_q else 'all',
 		'sub' if include_subplans else 'nosub')
-
-	if os.path.exists(workload_file_path + 'template2queries.pkl'):
-		loaded = []
-		for name in _CACHE_FILES:
-			print("load {}".format(name))
-			with open(workload_file_path + name + '.pkl', "rb") as pickle_file:
-				loaded.append(pickle.load(pickle_file))
-		return tuple(loaded)
+	# The test prefix carries the directory name so evaluating a different test workload
+	# does not silently reuse this one's cache.
+	test_prefix = "{}joblight-test-{}-{}-".format(
+		saved_directory, os.path.basename(os.path.normpath(test_directory)) or 'queries',
+		'sub' if include_test_subplans else 'nosub')
 
 	os.makedirs(saved_directory, exist_ok=True)
 
+	if os.path.exists(train_prefix + 'template2queries.pkl'):
+		(template2queries, template2cards, template2pgcards,
+		 train_featlens) = _load_cache(train_prefix, _TRAIN_CACHE_FILES)
+	else:
+		train_featlens = {table: {} for table in TABLE_SIZES}
+		print("processing training queries from {}".format(train_directory))
+		train_data = _load_directory(train_directory, col2minmax, train_featlens,
+		                             max_files=num_train_q, with_subplans=include_subplans,
+		                             saved_predicates={})
+
+		(template2queries, template2cards, template2pgcards, template2raw,
+		 _) = _group_by_table_tuple(*train_data)
+		print("training queries: {} across {} join templates".format(
+			len(train_data[0]), len(template2queries)))
+
+		_write_raw_csv(train_prefix + 'train_raw_queries.csv', template2cards,
+		               template2pgcards, template2raw)
+		_save_cache(train_prefix, _TRAIN_CACHE_FILES,
+		            (template2queries, template2cards, template2pgcards, train_featlens))
+
+	if os.path.exists(test_prefix + 'test_template2queries.pkl'):
+		(test_template2queries, test_template2cards, test_template2pgcards,
+		 test_template2files, test_featlens) = _load_cache(test_prefix, _TEST_CACHE_FILES)
+	else:
+		test_featlens = {table: {} for table in TABLE_SIZES}
+		print("processing test queries from {}{}".format(
+			test_directory, " (with subplans)" if include_test_subplans else ""))
+		test_data = _load_directory(test_directory, col2minmax, test_featlens,
+		                            with_subplans=include_test_subplans,
+		                            saved_predicates=None)
+
+		(test_template2queries, test_template2cards, test_template2pgcards, test_template2raw,
+		 test_template2files) = _group_by_table_tuple(*test_data)
+		print("test queries: {} across {} join templates".format(
+			len(test_data[0]), len(test_template2queries)))
+
+		_write_raw_csv(test_prefix + 'test_raw_queries.csv', test_template2cards,
+		               test_template2pgcards, test_template2raw)
+		_save_cache(test_prefix, _TEST_CACHE_FILES,
+		            (test_template2queries, test_template2cards, test_template2pgcards,
+		             test_template2files, test_featlens))
+
+	# Feature lengths are per-column maxima over whatever queries were seen, so the two
+	# independently parsed halves combine by taking the larger of each entry.
 	colid2featlen_per_table = {table: {} for table in TABLE_SIZES}
-	saved_predicates = {}
+	_merge_featlens(colid2featlen_per_table, train_featlens)
+	_merge_featlens(colid2featlen_per_table, test_featlens)
 
-	print("processing training queries from {}".format(train_directory))
-	train_data = _load_directory(train_directory, col2minmax, colid2featlen_per_table,
-	                             max_files=num_train_q, with_subplans=include_subplans,
-	                             saved_predicates=saved_predicates)
-
-	print("processing test queries from {}".format(test_directory))
-	test_data = _load_directory(test_directory, col2minmax, colid2featlen_per_table)
-
-	template2queries, template2cards, template2pgcards, template2raw = \
-		_group_by_table_tuple(*train_data)
-	test_template2queries, test_template2cards, test_template2pgcards, test_template2raw = \
-		_group_by_table_tuple(*test_data)
-
-	print("training queries: {} across {} join templates".format(
-		len(train_data[0]), len(template2queries)))
-	print("test queries: {} across {} join templates".format(
-		len(test_data[0]), len(test_template2queries)))
-
-	_write_raw_csv(workload_file_path + 'train_raw_queries.csv', template2cards,
-	               template2pgcards, template2raw)
-	_write_raw_csv(workload_file_path + 'test_raw_queries.csv', test_template2cards,
-	               test_template2pgcards, test_template2raw)
-
-	result = (template2queries, template2cards, template2pgcards, test_template2queries,
-	          test_template2cards, test_template2pgcards, colid2featlen_per_table)
-
-	for name, obj in zip(_CACHE_FILES, result):
-		print("writing {}".format(name))
-		with open(workload_file_path + name + '.pkl', "wb") as pickle_file:
-			pickle.dump(obj, pickle_file)
-
-	return result
+	return (template2queries, template2cards, template2pgcards, test_template2queries,
+	        test_template2cards, test_template2pgcards, colid2featlen_per_table,
+	        test_template2files)

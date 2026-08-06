@@ -632,6 +632,8 @@ def read_query_file_batched(col2minmax, num_q=10000, test_size=1000, directory_l
 	
 	workload_file_path = "{}grasp{}-{}-".format(saved_ditectory, templates_name, sub_templates_in_training_ratio)
 
+	os.makedirs(os.path.dirname(workload_file_path), exist_ok=True)
+
 	if os.path.exists(workload_file_path + 'template2queries.pkl'):
 		print("load template2queries")
 		with open(workload_file_path + 'template2queries.pkl', "rb") as pickle_file:

@@ -16,6 +16,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import numpy as np
 import pandas as pd
 import torch
+from scipy.stats import gmean
 from torch.nn.utils import clip_grad_norm_
 from tqdm import tqdm
 
@@ -25,7 +26,13 @@ from CEB_utlities.join_utilits_joblight import (
 	read_joblight_query_files,
 )
 from GRASP.join_handler_ceb import JoinHandler
-from utils import get_join_qerror
+from utils import (
+	get_join_qerror,
+	make_run_dir,
+	plot_estimations,
+	resolve_run_id,
+	save_run_config,
+)
 
 import random
 
@@ -37,6 +44,7 @@ JOBLIGHT_TRAIN_DIRECTORY = "C:/Ottawa/RA/Query/Cardinality Estimation/RobustMSCN
 JOBLIGHT_TEST_DIRECTORY = "C:/Ottawa/RA/Query/Cardinality Estimation/RobustMSCN/queries/joblight/all_joblight"
 PROCESSED_WORKLOAD_DIRECTORY = "processed_workload/joblight/"
 MIN_MAX_FILE = "queries/column_min_max_vals_imdb.csv"
+RESULTS_ROOT = "results"
 
 TEST_BATCH_SIZE = 3000
 
@@ -50,7 +58,7 @@ def _new_bucket(with_pg=False):
 
 
 def _bucket_queries(template2queries, template2cards, template2pgcards, residual,
-                    group_by_parent, with_pg):
+                    group_by_parent, with_pg, template2files=None):
 	"""Groups query records into per-join-template buckets the JoinHandler can batch.
 
 	group_by_parent picks which table tuple keys the bucket: training batches a subplan
@@ -61,6 +69,7 @@ def _bucket_queries(template2queries, template2cards, template2pgcards, residual
 	for template in template2queries:
 		cards = template2cards[template]
 		pg_cards = template2pgcards[template]
+		files = template2files[template] if template2files else None
 
 		for qid, record in enumerate(template2queries[template]):
 			(q, q_context, q_reps, parent_key_groups, key_groups_per_q, parent_table_tuple,
@@ -82,9 +91,20 @@ def _bucket_queries(template2queries, template2cards, template2pgcards, residual
 
 			if with_pg:
 				bucket['pg_cards'].append(pg_cards[qid])
-				bucket['query_ids'].append((template, qid))
+				# Enough to identify the row in the estimations csv on its own: which qrep
+				# file it came from, which tables this row joins, and the tables of the
+				# whole query it was taken from. template2* is keyed by the record's own
+				# tables, so a subplan is only recognisable as one by comparing the two.
+				bucket['query_ids'].append((template, qid,
+				                            files[qid] if files else '',
+				                            tuple(table_tuple), tuple(parent_table_tuple)))
 
 	return buckets
+
+
+def _full_query_indices(query_ids):
+	"""Positions of rows that are a whole test query rather than one of its subplans."""
+	return [i for i, row in enumerate(query_ids) if row[3] == row[4]]
 
 
 def _evaluate(join_handler, test_loaders, is_cuda):
@@ -115,27 +135,46 @@ def _evaluate(join_handler, test_loaders, is_cuda):
 
 
 def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4, residual=0,
-                num_train_q=None, include_subplans=True,
+                num_train_q=None, include_subplans=True, include_test_subplans=False,
                 train_directory=JOBLIGHT_TRAIN_DIRECTORY,
                 test_directory=JOBLIGHT_TEST_DIRECTORY,
-                saved_directory=PROCESSED_WORKLOAD_DIRECTORY):
+                saved_directory=PROCESSED_WORKLOAD_DIRECTORY,
+                run_id=None, results_root=RESULTS_ROOT):
 	start_time = time.time()
 	cdf_model_choice = 'arcdf'
 
-	res_file = open("./grasp_joblight_lcssize_{}_lr_{}_bs_{}.txt".format(lcs_dim, lr, bs), 'a')
+	# Every artifact below lands in this run's own directory, so concurrent or repeated
+	# runs no longer overwrite each other's metrics, plots and checkpoints.
+	run_id = resolve_run_id(run_id)
+	run_dir = make_run_dir('joblight', run_id, results_root)
+	print("run id: {} -> writing results to {}".format(run_id, os.path.abspath(run_dir)))
+	save_run_config(run_dir, {
+		'run_id': run_id, 'workload': 'joblight', 'epochs': epoch,
+		'feature_dim': feature_dim, 'lcs_dim': lcs_dim, 'bs': bs, 'lr': lr,
+		'residual': residual, 'num_train_q': num_train_q,
+		'include_subplans': include_subplans,
+		'include_test_subplans': include_test_subplans, 'train_directory': train_directory,
+		'test_directory': test_directory, 'saved_directory': saved_directory,
+		'is_cuda': is_cuda, 'started_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+	})
+
+	res_file = open(os.path.join(run_dir, "grasp_joblight_lcssize_{}_lr_{}_bs_{}.txt".format(
+		lcs_dim, lr, bs)), 'a')
 
 	(table_list, table_dim_list, table_like_dim_list, table_sizes, table_key_groups,
 	 table_join_keys, table_text_cols, table_normal_cols, col_type, col2minmax) = \
 		get_joblight_table_info(MIN_MAX_FILE)
 
 	(template2queries, template2cards, template2pgcards, test_template2queries,
-	 test_template2cards, test_template2pgcards, colid2featlen_per_table) = \
+	 test_template2cards, test_template2pgcards, colid2featlen_per_table,
+	 test_template2files) = \
 		read_joblight_query_files(col2minmax=col2minmax,
 		                          train_directory=train_directory,
 		                          test_directory=test_directory,
 		                          saved_directory=saved_directory,
 		                          num_train_q=num_train_q,
-		                          include_subplans=include_subplans)
+		                          include_subplans=include_subplans,
+		                          include_test_subplans=include_test_subplans)
 
 	t2ops = get_table_to_ops(template2queries, test_template2queries)
 	for t in t2ops:
@@ -157,7 +196,7 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4, residu
 	                                   residual, group_by_parent=False, with_pg=False)
 	test_buckets = _bucket_queries(test_template2queries, test_template2cards,
 	                               test_template2pgcards, residual, group_by_parent=True,
-	                               with_pg=True)
+	                               with_pg=True, template2files=test_template2files)
 
 	num_qs = sum(len(bucket['cards']) for bucket in training_buckets.values())
 	num_test_qs = sum(len(bucket['cards']) for bucket in test_buckets.values())
@@ -220,10 +259,16 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4, residu
 	### postgres baseline on the same test workload
 	pg_est = []
 	pg_true = []
+	pg_ids = []
 	for bucket in test_buckets.values():
 		pg_est.extend(bucket['pg_cards'])
 		pg_true.extend(bucket['cards'])
+		pg_ids.extend(bucket['query_ids'])
 	get_join_qerror(list(pg_est), list(pg_true), "postgres-joblight", res_file, -1)
+	if include_test_subplans:
+		full_ids = _full_query_indices(pg_ids)
+		get_join_qerror([pg_est[i] for i in full_ids], [pg_true[i] for i in full_ids],
+		                "postgres-joblight-full-queries", res_file, -1)
 
 	progress_bar = tqdm(range(epoch), desc="Training progress")
 	for epoch_id in progress_bar:
@@ -304,21 +349,46 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4, residu
 			all_est, all_true, all_pg, all_ids = _evaluate(join_handler, test_loaders, is_cuda)
 			get_join_qerror(list(all_est), list(all_true), "joblight", res_file, epoch_id)
 
+			if include_test_subplans:
+				# Subplans outnumber the full joins several times over, so report the 70
+				# whole queries separately - that is the number comparable to runs without
+				# test subplans.
+				full_ids = _full_query_indices(all_ids)
+				get_join_qerror([all_est[i] for i in full_ids], [all_true[i] for i in full_ids],
+				                "joblight-full-queries", res_file, epoch_id)
+
 			if (epoch_id + 1) % 10 == 0:
-				join_handler.save_models(epoch_id + 1, bs, lr, lcs_dim)
+				join_handler.save_models(epoch_id + 1, bs, lr, lcs_dim,
+				                         save_directory=os.path.join(run_dir, 'saved_models') + os.sep)
 
 			if epoch_id == epoch - 1:
+				# all_ids entries are (grouping tables, position within that group, qrep
+				# file, tables this row joins, tables of the query it came from).
 				estimations_df = pd.DataFrame({
-					'template': [str(qid[0]) for qid in all_ids],
-					'query_id': [qid[1] for qid in all_ids],
+					'query_file': [row[2] for row in all_ids],
+					'template': [str(row[4]) for row in all_ids],
+					'subplan_tables': [str(row[3]) for row in all_ids],
+					'is_full_query': [int(row[3] == row[4]) for row in all_ids],
+					'query_id': [row[1] for row in all_ids],
 					'pg_estimate': all_pg,
 					'true_cardinality': all_true,
 					'model_estimate': all_est,
 				})
-				estimations_df.to_csv('joblight_estimations_dataframe.csv', index=False)
-				print("Estimations dataframe saved to 'joblight_estimations_dataframe.csv'")
+				estimations_path = os.path.join(run_dir, 'joblight_estimations_dataframe.csv')
+				estimations_df.to_csv(estimations_path, index=False)
+				print("Estimations dataframe saved to '{}'".format(estimations_path))
+
+				plot_estimations(all_pg, all_true, all_est, title='JOB-light',
+				                 out_dir=run_dir)
+				if include_test_subplans:
+					full_ids = _full_query_indices(all_ids)
+					plot_estimations([all_pg[i] for i in full_ids],
+					                 [all_true[i] for i in full_ids],
+					                 [all_est[i] for i in full_ids],
+					                 title='JOB-light full queries', out_dir=run_dir)
 
 	print("Total training time: {:.2f}s".format(time.time() - start_time))
+	print("run {} results in {}".format(run_id, os.path.abspath(run_dir)))
 	res_file.close()
 
 
@@ -336,17 +406,27 @@ def main():
 	                    help="cap on training query files (default: all)")
 	parser.add_argument("--no_subplans", action="store_true",
 	                    help="train on full queries only, skipping their subplans")
+	parser.add_argument("--test_subplans", action="store_true",
+	                    help="also evaluate every subplan of each test query, not just "
+	                         "the full join (default: full joins only)")
 	parser.add_argument("--train_directory", default=JOBLIGHT_TRAIN_DIRECTORY)
 	parser.add_argument("--test_directory", default=JOBLIGHT_TEST_DIRECTORY)
 	parser.add_argument("--saved_directory", default=PROCESSED_WORKLOAD_DIRECTORY)
+	parser.add_argument("--run_id", default=None,
+	                    help="label for this run's results directory "
+	                         "(default: scheduler job id, else timestamp-pid)")
+	parser.add_argument("--results_root", default=RESULTS_ROOT,
+	                    help="root directory holding per-run result directories")
 	args = parser.parse_args()
 
 	train_grasp(args.epochs, args.feature_dim, args.lcs_dim, args.bs, lr=args.lr,
 	            residual=args.residual, num_train_q=args.num_train_q,
 	            include_subplans=not args.no_subplans,
+	            include_test_subplans=args.test_subplans,
 	            train_directory=args.train_directory,
 	            test_directory=args.test_directory,
-	            saved_directory=args.saved_directory)
+	            saved_directory=args.saved_directory,
+	            run_id=args.run_id, results_root=args.results_root)
 
 
 if __name__ == "__main__":

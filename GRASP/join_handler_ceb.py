@@ -43,6 +43,9 @@ JOIN_MAP_IMDB_UPPER_BOUND = {
 }
 
 reverse_alias = {value: key for key, value in ALIAS.items()}
+# JOB-light spells the movie_info_idx alias 'mi_idx'. Keeping it distinct from 'mii' also
+# keeps it off the arcdf branch below, which exists for CEB's wide-range mii.info column.
+reverse_alias['mi_idx'] = 'movie_info_idx'
 
 OPS = ['lt', 'eq', 'in', 'like']
 

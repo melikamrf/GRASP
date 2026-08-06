@@ -2,7 +2,6 @@ import math
 import os
 import time
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 import argparse
@@ -26,8 +25,10 @@ is_cuda = torch.cuda.is_available()
 
 IMDB_DIRECTORY = "./queries/ceb-imdb-full/"	# directory to save the IMDB dataset
 PROCESSED_WORKLOAD_DIRECTORY = "./processed_workloads/imdb/" # directory to save processed workloads
+RESULTS_ROOT = "results"
 
-def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4, residual=0):
+def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4, residual=0,
+				run_id=None, results_root=RESULTS_ROOT):
 	start_time = time.time()
 	num_q = 3000
 	cdf_model_choice = 'arcdf'
@@ -52,7 +53,20 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4, residu
 	directory_list = [IMDB_DIRECTORY + temp_name + "/" for temp_name in template_list]
 
 
-	res_file = open("./grasp_{}_ratio_{}_lcssize_{}_lr_{}_bs_{}.txt".format(",".join(template_list), sub_templates_in_training_ratio, lcs_dim, lr, bs), 'a')
+	# Every artifact below lands in this run's own directory, so concurrent or repeated
+	# runs no longer overwrite each other's metrics, plots and checkpoints.
+	run_id = resolve_run_id(run_id)
+	run_dir = make_run_dir('ceb', run_id, results_root)
+	print("run id: {} -> writing results to {}".format(run_id, os.path.abspath(run_dir)))
+	save_run_config(run_dir, {
+		'run_id': run_id, 'workload': 'ceb', 'epochs': epoch, 'feature_dim': feature_dim,
+		'lcs_dim': lcs_dim, 'bs': bs, 'lr': lr, 'residual': residual, 'num_q': num_q,
+		'template_list': template_list,
+		'sub_templates_in_training_ratio': sub_templates_in_training_ratio,
+		'is_cuda': is_cuda, 'started_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+	})
+
+	res_file = open(os.path.join(run_dir, "grasp_{}_ratio_{}_lcssize_{}_lr_{}_bs_{}.txt".format(",".join(template_list), sub_templates_in_training_ratio, lcs_dim, lr, bs)), 'a')
 
 
 	(table_list, table_dim_list, table_like_dim_list, table_sizes, table_key_groups,
@@ -495,7 +509,8 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4, residu
 					'seen_test_losses': seen_test_losses,
 					'unseen_test_losses': unseen_test_losses
 				}
-				join_handler.save_models(epoch_id + 1, bs, lr, lcs_dim)
+				join_handler.save_models(epoch_id + 1, bs, lr, lcs_dim,
+										save_directory=os.path.join(run_dir, 'saved_models') + os.sep)
 			# last epoch:
 			if epoch_id == epoch - 1:
 				# Collect all data from seen test set
@@ -572,18 +587,20 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4, residu
 				estimations_df = pd.concat([seen_df, unseen_df], ignore_index=True)
 				
 				# Save to CSV
-				estimations_df.to_csv('estimations_dataframe.csv', index=False)
-				print("Estimations dataframe saved to 'estimations_dataframe.csv'")
-				
+				estimations_path = os.path.join(run_dir, 'estimations_dataframe.csv')
+				estimations_df.to_csv(estimations_path, index=False)
+				print("Estimations dataframe saved to '{}'".format(estimations_path))
+
 				# Plot estimations for both seen and unseen
-				plot_estimations(seen_pg_cards, seen_true_cards, seen_est_cards, title='Seen Templates')
-				plot_estimations(unseen_pg_cards, unseen_true_cards, unseen_est_cards, title='Unseen Templates')
+				plot_estimations(seen_pg_cards, seen_true_cards, seen_est_cards, title='Seen Templates', out_dir=run_dir)
+				plot_estimations(unseen_pg_cards, unseen_true_cards, unseen_est_cards, title='Unseen Templates', out_dir=run_dir)
 
 
 
 	# Log total training time and finish
 	total_time = time.time() - start_time
 	print(f"Total training time: {total_time:.2f}s")
+	print(f"run {run_id} results in {os.path.abspath(run_dir)}")
 	
 	
 	# Plot training and validation curves
@@ -638,46 +655,9 @@ def train_grasp(epoch=100, feature_dim=256, lcs_dim=500, bs=128, lr=5e-4, residu
 	res_file.close()
 	return pg_q_errors
 
-def plot_estimations(pg, true_cards, est, title='unseen'):
-
-	# The callers pass Python lists; arithmetic below needs arrays.
-	pg = np.asarray(pg, dtype=np.float64)
-	true_cards = np.asarray(true_cards, dtype=np.float64)
-	est = np.asarray(est, dtype=np.float64)
-	# PG can report 0 rows, which would make the ratio inf/nan.
-	ratio = true_cards / np.maximum(pg, 1.)
-
-	plt.figure(figsize=(12, 6))
-	plt.suptitle(title)
-	plt.subplot(1,2,1)
-	plt.plot(pg, label='PG Estimations', color='blue', alpha=0.7)
-	plt.plot(true_cards, label='True Cardinalities', color='orange', alpha=0.7)
-	plt.plot(est, label='GRASP Estimations', color='green', alpha=0.7)
-	plt.plot(ratio, label='True/PG Ratio', color='red', alpha=0.7)
-	plt.yscale('log')
-	plt.xlabel('Query Index')
-	plt.ylabel('Cardinality')
-	plt.legend()
-	plt.grid(True)
-
-	plt.subplot(1,2,2)
-	plt.scatter(true_cards, pg, label='PG Estimations', color='blue', alpha=0.7)
-	plt.scatter(true_cards, est, label='GRASP Estimations', color='green', alpha=0.7)
-	plt.xscale('log')
-	plt.yscale('log')
-	plt.legend()
-	plt.xlabel('True Cardinalities')
-	plt.ylabel('Estimated Cardinality')
-	plt.grid(True)
-
-	plt.tight_layout()
-	plot_path = f"estimations_plot_{title.replace(' ', '_').lower()}.png"
-	plt.savefig(plot_path)
-	plt.close()
-	print(f"Estimations plot saved as '{plot_path}'")
+# plot_estimations now lives in utils.py, shared with train_grasp_joblight.
 
 
-	
 def main():
 	"""
 	Main function to parse command-line arguments and initiate the training process.
@@ -695,11 +675,17 @@ def main():
 	parser.add_argument("--lcs_dim", help="Dimension of the latent space of LCS model (default: 500)", type=int, default=500)
 	parser.add_argument("--bs", help="batch size (default: 128)", type=int, default=128)
 	parser.add_argument("--residual", type=int, default=0)
+	parser.add_argument("--run_id", default=None,
+						help="label for this run's results directory "
+							 "(default: scheduler job id, else timestamp-pid)")
+	parser.add_argument("--results_root", default=RESULTS_ROOT,
+						help="root directory holding per-run result directories")
 	args = parser.parse_args()
 
 	is_cuda = torch.cuda.is_available()
 
-	pg_q_errors = train_grasp(args.epochs, args.feature_dim, args.lcs_dim, args.bs, residual=args.residual)
+	pg_q_errors = train_grasp(args.epochs, args.feature_dim, args.lcs_dim, args.bs, residual=args.residual,
+							  run_id=args.run_id, results_root=args.results_root)
 
 
 if __name__ == "__main__":
